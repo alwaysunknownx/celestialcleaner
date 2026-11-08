@@ -1,0 +1,246 @@
+<#
+  ___  ___ _    ___ ___ _____ _   _   _    _
+ / __|| __| |  | __/ __|_   _| | /_\ | |  | |
+| (__ | _|| |__| _|\__ \ | | | |/ _ \| |__| |__
+ \___||___|____|___|___/ |_| |_/_/ \_\____|____|
+
+  by CELESTIAL
+#>
+#Requires -RunAsAdministrator
+# language: PowerShell, file: Cleaner.ps1, target: Windows 10/11, PowerShell 5.1+
+# Targets: Matrix, NewUI, Celestial, Blackfade, Nightshade, triggerbot, aimbot, esp, svchost_tmp
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'SilentlyContinue'
+
+$TARGETS = @('Matrix','NewUI','Celestial','Blackfade','Nightshade',
+             'triggerbot','aimbot','esp','svchost_tmp')
+$PATTERN = ($TARGETS | ForEach-Object { [regex]::Escape($_) }) -join '|'
+
+function Log-Step { param([string]$m) Write-Host "`n[>] $m" -ForegroundColor Cyan   }
+function Log-Hit  { param([string]$m) Write-Host "    [+] $m" -ForegroundColor Green  }
+function Log-Skip { param([string]$m) Write-Host "    [-] $m" -ForegroundColor DarkGray }
+function Log-Warn { param([string]$m) Write-Host "    [!] $m" -ForegroundColor Yellow }
+
+# ─── 1. PREFETCH ─────────────────────────────────────────────────────────────
+Log-Step "Prefetch"
+try {
+    Get-ChildItem 'C:\Windows\Prefetch' -Filter '*.pf' |
+    Where-Object { $_.Name -match $PATTERN } |
+    ForEach-Object {
+        try { Remove-Item $_.FullName -Force; Log-Hit "Deleted: $($_.Name)" }
+        catch { Log-Warn "Locked: $($_.Name)" }
+    }
+} catch { Log-Warn "Prefetch inacessivel" }
+
+# ─── 2. EVENT LOGS ───────────────────────────────────────────────────────────
+Log-Step "Event Logs"
+
+$watchedLogs = @(
+    'Microsoft-Windows-Defender/Operational',
+    'Microsoft-Windows-Windows Defender/Operational',
+    'Microsoft-Windows-Diagnostics-Performance/Operational',
+    'Application',
+    'System'
+)
+
+foreach ($logName in $watchedLogs) {
+    try {
+        $hits = @(Get-WinEvent -LogName $logName -MaxEvents 2000 -ErrorAction Stop |
+                  Where-Object { $_.Message -match $PATTERN })
+        if ($hits.Count -gt 0) {
+            wevtutil cl "$logName" 2>$null
+            Log-Hit "Limpo: $logName ($($hits.Count) entradas encontradas)"
+        } else {
+            Log-Skip "Sem matches: $logName"
+        }
+    } catch { Log-Skip "Indisponivel: $logName" }
+}
+
+$defSupport = "$env:ProgramData\Microsoft\Windows Defender\Support"
+if (Test-Path $defSupport) {
+    Get-ChildItem $defSupport -Recurse -File | ForEach-Object {
+        try {
+            if (Select-String -Path $_.FullName -Pattern $PATTERN -Quiet) {
+                Remove-Item $_.FullName -Force
+                Log-Hit "Defender log deletado: $($_.Name)"
+            }
+        } catch {}
+    }
+}
+
+$defHistory = "$env:ProgramData\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory"
+if (Test-Path $defHistory) {
+    try {
+        Remove-Item "$defHistory\*" -Force -Recurse
+        Log-Hit "Detection history limpa"
+    } catch { Log-Warn "Detection history parcialmente bloqueada" }
+}
+
+# ─── 3. RECENT / LNK ─────────────────────────────────────────────────────────
+Log-Step "Recent Files e LNK"
+@(
+    "$env:APPDATA\Microsoft\Windows\Recent",
+    "$env:APPDATA\Microsoft\Office\Recent"
+) | Where-Object { Test-Path $_ } | ForEach-Object {
+    Get-ChildItem $_ -File | Where-Object { $_.Name -match $PATTERN } | ForEach-Object {
+        try { Remove-Item $_.FullName -Force; Log-Hit "LNK deletado: $($_.Name)" }
+        catch { Log-Warn "Locked: $($_.Name)" }
+    }
+}
+
+# ─── 4. JUMP LISTS ───────────────────────────────────────────────────────────
+Log-Step "Jump Lists"
+@(
+    "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations",
+    "$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations"
+) | Where-Object { Test-Path $_ } | ForEach-Object {
+    Get-ChildItem $_ -File | ForEach-Object {
+        try {
+            $raw = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::Latin1)
+            if ($raw -match $PATTERN) {
+                Remove-Item $_.FullName -Force
+                Log-Hit "Jump list deletada: $($_.Name)"
+            }
+        } catch {}
+    }
+}
+
+# ─── 5. MUICACHE ─────────────────────────────────────────────────────────────
+Log-Step "MUICache"
+$muiPath = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache'
+if (Test-Path $muiPath) {
+    (Get-Item $muiPath).GetValueNames() | Where-Object { $_ -match $PATTERN } | ForEach-Object {
+        try { Remove-ItemProperty -Path $muiPath -Name $_ -Force; Log-Hit "MUI removido: $_" }
+        catch { Log-Warn "MUI locked: $_" }
+    }
+}
+
+# ─── 6. USERASSIST (ROT13) ───────────────────────────────────────────────────
+Log-Step "UserAssist"
+
+function ConvertFrom-ROT13 {
+    param([string]$s)
+    -join ($s.ToCharArray() | ForEach-Object {
+        $c = [int][char]$_
+        if    ($c -ge 65 -and $c -le 90)  { [char](($c - 65 + 13) % 26 + 65) }
+        elseif($c -ge 97 -and $c -le 122) { [char](($c - 97 + 13) % 26 + 97) }
+        else  { [char]$c }
+    })
+}
+
+$uaBase = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist'
+if (Test-Path $uaBase) {
+    Get-ChildItem $uaBase | ForEach-Object {
+        $countPath = Join-Path $_.PSPath 'Count'
+        if (Test-Path $countPath) {
+            (Get-Item $countPath).GetValueNames() | ForEach-Object {
+                $decoded = ConvertFrom-ROT13 $_
+                if ($decoded -match $PATTERN) {
+                    try {
+                        Remove-ItemProperty -Path $countPath -Name $_ -Force
+                        Log-Hit "UserAssist removido: $decoded"
+                    } catch { Log-Warn "UserAssist locked: $decoded" }
+                }
+            }
+        }
+    }
+}
+
+# ─── 7. BAM / DAM ────────────────────────────────────────────────────────────
+Log-Step "BAM / DAM"
+foreach ($svc in @('bam','dam')) {
+    $base = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc\State\UserSettings"
+    if (Test-Path $base) {
+        Get-ChildItem $base | ForEach-Object {
+            $sidPath = $_.PSPath
+            try {
+                (Get-Item $sidPath).GetValueNames() | Where-Object { $_ -match $PATTERN } | ForEach-Object {
+                    try {
+                        Remove-ItemProperty -Path $sidPath -Name $_ -Force
+                        Log-Hit "$($svc.ToUpper()) removido: $_"
+                    } catch {}
+                }
+            } catch {}
+        }
+    }
+}
+
+# ─── 8. TEMP ─────────────────────────────────────────────────────────────────
+Log-Step "Temp directories"
+@($env:TEMP, $env:TMP, 'C:\Windows\Temp', "$env:LOCALAPPDATA\Temp") |
+Select-Object -Unique | Where-Object { Test-Path $_ } | ForEach-Object {
+    Get-ChildItem $_ -Recurse -Force |
+    Where-Object { $_.Name -match $PATTERN } | ForEach-Object {
+        try { Remove-Item $_.FullName -Force -Recurse; Log-Hit "Temp deletado: $($_.FullName)" }
+        catch { Log-Warn "Temp locked: $($_.FullName)" }
+    }
+}
+
+# ─── 9. SHIMCACHE ────────────────────────────────────────────────────────────
+Log-Step "Shimcache"
+$shimPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache'
+try {
+    $val = (Get-Item $shimPath).GetValue('AppCompatCache')
+    [System.IO.File]::WriteAllBytes("$env:TEMP\shimcache_backup.bin", $val)
+    Remove-ItemProperty -Path $shimPath -Name 'AppCompatCache' -Force
+    Log-Hit "Shimcache removida — reboot IMEDIATO antes de abrir qualquer processo-alvo"
+} catch { Log-Warn "Shimcache: $($_.Exception.Message)" }
+
+# ─── 10. AMCACHE ─────────────────────────────────────────────────────────────
+Log-Step "Amcache.hve — tentativa via VSS"
+try {
+    $vss = Get-WmiObject Win32_ShadowCopy | Sort-Object InstallDate -Descending | Select-Object -First 1
+    if ($vss) {
+        $vssAmcache = $vss.DeviceObject + '\Windows\appcompat\Programs\Amcache.hve'
+        $dest = "$env:TEMP\Amcache_vss.hve"
+        cmd /c "copy `"$vssAmcache`" `"$dest`"" >$null 2>&1
+        if (Test-Path $dest) {
+            Log-Hit "Amcache copiada via VSS para $dest"
+            Log-Warn "Edite offline: carregue no regedit, delete entradas InventoryApplicationFile com os nomes-alvo, desmonte e substitua no WinPE"
+        } else {
+            Log-Warn "VSS falhou — Amcache requer WinPE para edicao offline"
+        }
+    } else {
+        Log-Warn "Sem snapshot VSS — Amcache requer WinPE"
+    }
+} catch { Log-Warn "Amcache: VSS inacessivel" }
+
+# ─── 11. ACTIVITY CACHE ──────────────────────────────────────────────────────
+Log-Step "ActivitiesCache.db (Windows Timeline)"
+Get-ChildItem "$env:LOCALAPPDATA\ConnectedDevicesPlatform" -Directory |
+ForEach-Object { Join-Path $_.FullName 'ActivitiesCache.db' } |
+Where-Object { Test-Path $_ } | ForEach-Object {
+    try {
+        Stop-Service -Name 'CDPUserSvc*' -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 600
+        Remove-Item $_ -Force
+        Remove-Item "$_-wal" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$_-shm" -Force -ErrorAction SilentlyContinue
+        Log-Hit "Activity cache deletada: $_"
+        Start-Service -Name 'CDPUserSvc*' -ErrorAction SilentlyContinue
+    } catch { Log-Warn "Activity cache locked: $_ — pare CDPUserSvc manualmente e delete" }
+}
+
+# ─── 12. THUMBNAIL CACHE ─────────────────────────────────────────────────────
+Log-Step "Thumbnail cache"
+$thumbPath = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer"
+if (Test-Path $thumbPath) {
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 800
+    Get-ChildItem $thumbPath -Filter 'thumbcache_*.db' | ForEach-Object {
+        try { Remove-Item $_.FullName -Force; Log-Hit "Thumbcache deletada: $($_.Name)" }
+        catch { Log-Warn "Thumbcache locked: $($_.Name)" }
+    }
+    Start-Process explorer
+}
+
+# ─── 13. SRUM ────────────────────────────────────────────────────────────────
+Log-Step "SRUM (System Resource Usage Monitor)"
+Log-Warn "SRUDB.dat bloqueado por srumsvc em sessao ativa"
+Log-Warn "Offline: parar srumsvc -> copiar C:\Windows\System32\sru\SRUDB.dat -> editar com ESEDatabaseView -> restaurar no WinPE"
+
+# ─── FIM ─────────────────────────────────────────────────────────────────────
+Write-Host "`n[✓] Varredura concluida." -ForegroundColor Green
+Write-Host "    REBOOT IMEDIATO — shimcache vive em memoria ate o shutdown." -ForegroundColor Red
+Write-Host "    Amcache e SRUM: passagem WinPE para cobertura total." -ForegroundColor Yellow
